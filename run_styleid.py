@@ -1,3 +1,8 @@
+# run_styleid.py
+"""
+python run_styleid.py --cnt ./data_vis/cnt --sty ./data_vis/sty
+
+"""
 import argparse, os
 import torch
 import numpy as np
@@ -89,7 +94,8 @@ def load_model_from_config(config, ckpt, verbose=False):
     model.eval()
     return model
 
-def main():
+
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cnt', default = './data/cnt')
     parser.add_argument('--sty', default = './data/sty')
@@ -105,14 +111,17 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.75, help='query preservation hyperparameter')
     parser.add_argument("--attn_layer", type=str, default='6,7,8,9,10,11', help='injection attention feature layers')
     parser.add_argument('--model_config', type=str, default='models/ldm/stable-diffusion-v1/v1-inference.yaml', help='model config')
-    parser.add_argument('--precomputed', type=str, default='./precomputed_feats', help='save path for precomputed feature')
+    parser.add_argument('--precomputed', type=str, default="/temp/hanmo/style_output/StyleID/precomputed_feats", help='save path for precomputed feature')  # './precomputed_feats'
     parser.add_argument('--ckpt', type=str, default='models/ldm/stable-diffusion-v1/model.ckpt', help='model checkpoint')
     parser.add_argument('--precision', type=str, default='autocast', help='choices: ["full", "autocast"]')
     parser.add_argument('--output_path', type=str, default='output')
     parser.add_argument("--without_init_adain", action='store_true')
     parser.add_argument("--without_attn_injection", action='store_true')
-    opt = parser.parse_args()
+    return parser.parse_args()
 
+
+def main():
+    opt = parse_args()
     feat_path_root = opt.precomputed
 
     seed_everything(22)
