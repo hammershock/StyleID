@@ -68,3 +68,5 @@ model:
 
     cond_stage_config:
       target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+      params:
+        version: "/temp/hanmo/models/clip-vit-large-patch14"
