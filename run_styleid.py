@@ -13,6 +13,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
 import copy
+from pathlib import Path
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -114,12 +115,84 @@ def parse_args():
     parser.add_argument('--precomputed', type=str, default="/temp/hanmo/style_output/StyleID/precomputed_feats", help='save path for precomputed feature')  # './precomputed_feats'
     parser.add_argument('--ckpt', type=str, default='models/ldm/stable-diffusion-v1/model.ckpt', help='model checkpoint')
     parser.add_argument('--precision', type=str, default='autocast', help='choices: ["full", "autocast"]')
-    parser.add_argument('--output_path', type=str, default='output')
+    parser.add_argument('--output_dir', type=str, default='output')
     parser.add_argument("--without_init_adain", action='store_true')
     parser.add_argument("--without_attn_injection", action='store_true')
     return parser.parse_args()
 
 
+
+def load_or_invert_feature(
+    img_path,        # 图像路径
+    feat_path_root,  # 预存路径根目录
+    feat_suffix,     # 保存名后缀（'_sty.pkl' 或 '_cnt.pkl'）
+    model, sampler,  # 模型与采样器
+    uc,              # 无条件条件（unconditional_conditioning）
+    ddim_inversion_steps,
+    time_idx_dict,
+    save_feature_timesteps,
+    start_step,
+    feat_maps,       # 全局特征映射表
+    device,
+    save_func,       # 保存特征回调函数（用于DDIM采样）
+):
+    """
+    通用化的内容/风格特征提取逻辑。
+    1️⃣ 若特征已存在 -> 直接加载
+    2️⃣ 若不存在 -> 进行DDIM反演提取特征并保存
+    返回:
+        feat, z_enc, feat_name, cache_hit
+    """
+    base_name = Path(img_path).stem
+    feat_name = os.path.join(feat_path_root, base_name + feat_suffix)
+    cache_hit = False
+
+    # ---------------------------
+    # 💾 Step 1: 尝试加载已有特征
+    # ---------------------------
+    if len(feat_path_root) > 0 and os.path.isfile(feat_name):
+        print(f"✅ Precomputed feature loading: {feat_name}")
+        with open(feat_name, 'rb') as h:
+            feat = pickle.load(h)
+            z_enc = torch.clone(feat[0]['z_enc'])
+        cache_hit = True
+
+    # ---------------------------
+    # 🚧 Step 2: 若不存在则执行反演提取
+    # ---------------------------
+    else:
+        print(f"🚧 Feature not found — building new: {feat_name}")
+        init_img = load_img(img_path).to(device)
+        init_img = model.get_first_stage_encoding(model.encode_first_stage(init_img))
+        z_enc, _ = sampler.encode_ddim(
+            init_img.clone(),
+            num_steps=ddim_inversion_steps,
+            unconditional_conditioning=uc,
+            end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
+            callback_ddim_timesteps=save_feature_timesteps,
+            img_callback=save_func,
+        )
+        feat = copy.deepcopy(feat_maps)
+        z_enc = feat[0]['z_enc']
+
+        # 🧾 自动保存新特征（启用缓存时）
+        if len(feat_path_root) > 0:
+            os.makedirs(feat_path_root, exist_ok=True)
+            with open(feat_name, 'wb') as h:
+                pickle.dump(feat, h)
+            print(f"💾 Saved new feature cache: {feat_name}")
+
+    return feat, z_enc, feat_name, cache_hit
+
+
+# def data_loader(sty_img_list, style_base_dir, cnt_img_list, cnt_base_dir):
+#     for sty_name in sty_img_list:
+#         for cnt_name in cnt_img_list:
+#             sty_path = os.path.join(style_base_dir, sty_name)
+#             cnt_path = os.path.join(cnt_base_dir, cnt_name)
+#             yield sty_name, sty_path, cnt_name, cnt_path
+            
+            
 def main():
     # ===========================
     # 🎯 1. 参数解析与基础设置
@@ -128,8 +201,7 @@ def main():
     feat_path_root = opt.precomputed
 
     seed_everything(22)
-    output_path = opt.output_path
-    os.makedirs(output_path, exist_ok=True)
+    os.makedirs(opt.output_dir, exist_ok=True)
     if len(feat_path_root) > 0:
         os.makedirs(feat_path_root, exist_ok=True)
     
@@ -206,118 +278,77 @@ def main():
 
     # 遍历所有风格图片
     for sty_name in sty_img_list:
-        # ---------------------------
-        # 🖼️ Step 4.1: 加载风格图像
-        # ---------------------------
-        sty_name_ = os.path.join(opt.sty, sty_name)
-        init_sty = load_img(sty_name_).to(device)
-        sty_feat_name = os.path.join(feat_path_root, os.path.basename(sty_name).split('.')[0] + '_sty.pkl')
-        sty_z_enc = None
-
-        # ---------------------------
-        # 💾 Step 4.2: 加载或反演风格特征
-        # ---------------------------
-        if len(feat_path_root) > 0 and os.path.isfile(sty_feat_name):
-            print("Precomputed style feature loading: ", sty_feat_name)
-            with open(sty_feat_name, 'rb') as h:
-                sty_feat = pickle.load(h)
-                sty_z_enc = torch.clone(sty_feat[0]['z_enc'])
-        else:
-            # DDIM 反演提取风格特征
-            init_sty = model.get_first_stage_encoding(model.encode_first_stage(init_sty))
-            sty_z_enc, _ = sampler.encode_ddim(init_sty.clone(),
-                                               num_steps=ddim_inversion_steps,
-                                               unconditional_conditioning=uc,
-                                               end_step=time_idx_dict[ddim_inversion_steps-1-start_step],
-                                               callback_ddim_timesteps=save_feature_timesteps,
-                                               img_callback=ddim_sampler_callback)
-            sty_feat = copy.deepcopy(feat_maps)
-            sty_z_enc = feat_maps[0]['z_enc']
-
-        # 遍历所有内容图片
         for cnt_name in cnt_img_list:
-            # ---------------------------
-            # 🖼️ Step 4.3: 加载内容图像
-            # ---------------------------
-            cnt_name_ = os.path.join(opt.cnt, cnt_name)
-            init_cnt = load_img(cnt_name_).to(device)
-            cnt_feat_name = os.path.join(feat_path_root, os.path.basename(cnt_name).split('.')[0] + '_cnt.pkl')
+            sty_path = os.path.join(opt.sty, sty_name)
+            cnt_path = os.path.join(opt.cnt, cnt_name)
+            output_name = f"{Path(cnt_name).stem}@{Path(sty_name).stem}.png"
+            output_path = os.path.join(opt.output_dir, output_name)
+            
+            # 🖼️ Step 4.1~4.2: 加载或反演风格特征
+            sty_feat, sty_z_enc, sty_feat_name, cache_hit = load_or_invert_feature(
+                img_path=sty_path,
+                feat_path_root=feat_path_root,
+                feat_suffix='_sty.pkl',
+                model=model,
+                sampler=sampler,
+                uc=uc,
+                ddim_inversion_steps=ddim_inversion_steps,
+                time_idx_dict=time_idx_dict,
+                save_feature_timesteps=save_feature_timesteps,
+                start_step=start_step,
+                feat_maps=feat_maps,
+                device=device,
+                save_func=ddim_sampler_callback
+            )
 
-            # ---------------------------
-            # 💾 Step 4.4: 加载或反演内容特征
-            # ---------------------------
-            if len(feat_path_root) > 0 and os.path.isfile(cnt_feat_name):
-                print("Precomputed content feature loading: ", cnt_feat_name)
-                with open(cnt_feat_name, 'rb') as h:
-                    cnt_feat = pickle.load(h)
-                    cnt_z_enc = torch.clone(cnt_feat[0]['z_enc'])
-            else:
-                init_cnt = model.get_first_stage_encoding(model.encode_first_stage(init_cnt))
-                cnt_z_enc, _ = sampler.encode_ddim(init_cnt.clone(),
-                                                   num_steps=ddim_inversion_steps,
-                                                   unconditional_conditioning=uc,
-                                                   end_step=time_idx_dict[ddim_inversion_steps-1-start_step],
-                                                   callback_ddim_timesteps=save_feature_timesteps,
-                                                   img_callback=ddim_sampler_callback)
-                cnt_feat = copy.deepcopy(feat_maps)
-                cnt_z_enc = feat_maps[0]['z_enc']
-
-            # ===========================
+            # 🖼️ Step 4.3~4.4: 加载或反演内容特征
+            cnt_feat, cnt_z_enc, cnt_feat_name, cache_hit = load_or_invert_feature(
+                img_path=cnt_path,
+                feat_path_root=feat_path_root,
+                feat_suffix='_cnt.pkl',
+                model=model,
+                sampler=sampler,
+                uc=uc,
+                ddim_inversion_steps=ddim_inversion_steps,
+                time_idx_dict=time_idx_dict,
+                save_feature_timesteps=save_feature_timesteps,
+                start_step=start_step,
+                feat_maps=feat_maps,
+                device=device,
+                save_func=ddim_sampler_callback
+            )               
+            
             # 🎨 5. 特征融合与风格生成阶段
-            # ===========================
-            with torch.no_grad():
-                with precision_scope("cuda"):
-                    with model.ema_scope():
-                        output_name = f"{os.path.basename(cnt_name).split('.')[0]}_stylized_{os.path.basename(sty_name).split('.')[0]}.png"
-                        print(f"Inversion end: {time.time() - begin:.2f}s")
+            with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
+                # 5.1 特征归一化融合（AdaIN）
+                adain_z_enc = cnt_z_enc if opt.without_init_adain else adain(cnt_z_enc, sty_z_enc)
+                
+                # 5.2 注意力特征注入融合
+                feat_maps = None if opt.without_attn_injection else feat_merge(opt, cnt_feat, sty_feat, start_step=start_step)
 
-                        # 5.1 特征归一化融合（AdaIN）
-                        if opt.without_init_adain:
-                            adain_z_enc = cnt_z_enc
-                        else:
-                            adain_z_enc = adain(cnt_z_enc, sty_z_enc)
+                # 5.3 执行风格化采样（反向扩散生成）
+                samples_ddim, _intermediates = sampler.sample(
+                    S=ddim_steps,
+                    batch_size=1,
+                    shape=shape,
+                    verbose=False,
+                    unconditional_conditioning=uc,
+                    eta=opt.ddim_eta,
+                    x_T=adain_z_enc,
+                    injected_features=feat_maps,
+                    start_step=start_step,
+                )
 
-                        # 5.2 注意力特征注入融合
-                        feat_maps = feat_merge(opt, cnt_feat, sty_feat, start_step=start_step)
-                        if opt.without_attn_injection:
-                            feat_maps = None
-
-                        # 5.3 执行风格化采样（反向扩散生成）
-                        samples_ddim, intermediates = sampler.sample(
-                            S=ddim_steps,
-                            batch_size=1,
-                            shape=shape,
-                            verbose=False,
-                            unconditional_conditioning=uc,
-                            eta=opt.ddim_eta,
-                            x_T=adain_z_enc,
-                            injected_features=feat_maps,
-                            start_step=start_step,
-                        )
-
-                        # ===========================
-                        # 💾 6. 解码与结果保存阶段
-                        # ===========================
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
-                        x_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
-                        x_sample = 255. * rearrange(x_image_torch[0].cpu().numpy(), 'c h w -> h w c')
-                        img = Image.fromarray(x_sample.astype(np.uint8))
-                        img.save(os.path.join(output_path, output_name))
-
-                        # ---------------------------
-                        # 🧾 Step 6.1: 特征缓存存储
-                        # ---------------------------
-                        if len(feat_path_root) > 0:
-                            print("Save features")
-                            if not os.path.isfile(cnt_feat_name):
-                                with open(cnt_feat_name, 'wb') as h:
-                                    pickle.dump(cnt_feat, h)
-                            if not os.path.isfile(sty_feat_name):
-                                with open(sty_feat_name, 'wb') as h:
-                                    pickle.dump(sty_feat, h)
-
+                # 💾 6. 解码与结果保存阶段
+                x_samples_ddim = model.decode_first_stage(samples_ddim)
+                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                x_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
+                x_sample = 255. * rearrange(x_image_torch[0].cpu().numpy(), 'c h w -> h w c')
+                img = Image.fromarray(x_sample.astype(np.uint8))
+                img.save(output_path)
+                print(f"image saved to {output_path}")
+                
     # ===========================
     # ✅ 7. 全流程结束
     # ===========================
