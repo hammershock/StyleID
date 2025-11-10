@@ -1,6 +1,9 @@
 # run_styleid.py
 """
 python run_styleid.py --cnt ./data_vis/cnt --sty ./data_vis/sty
+python run_styleid.py --cnt /temp/hanmo/data/pairs2k/COCO_subset --sty /temp/hanmo/data/pairs2k/Style30k_subset \
+    --output_dir /temp/hanmo/style_output/StyleID/pairs2k \
+    --precomputed /temp/hanmo/cache/StyleID/precomputed_feats \
 
 """
 import argparse, os
@@ -20,10 +23,25 @@ from ldm.models.diffusion.ddim import DDIMSampler
 
 import torchvision.transforms as transforms
 import torch.nn.functional as F
+import json
+from datetime import datetime
 import time
 import pickle
 
 feat_maps = []
+
+def format_duration(seconds: float) -> str:
+    """将浮点秒数格式化为人类可读的时间字符串"""
+    seconds = float(seconds)
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    elif seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {s:.2f}s"
+    else:
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{int(h)}h {int(m)}m {s:.2f}s"
 
 def save_img_from_sample(model, samples_ddim, fname):
     x_samples_ddim = model.decode_first_stage(samples_ddim)
@@ -56,17 +74,31 @@ def feat_merge(opt, cnt_feats, sty_feats, start_step=0):
     return feat_maps
 
 
+# def load_img(path):
+#     image = Image.open(path).convert("RGB")
+#     x, y = image.size
+#     print(f"Loaded input image of size ({x}, {y}) from {path}")
+#     h = w = 512
+#     image = transforms.CenterCrop(min(x,y))(image)
+#     image = image.resize((w, h), resample=Image.Resampling.LANCZOS)
+#     image = np.array(image).astype(np.float32) / 255.0
+#     image = image[None].transpose(0, 3, 1, 2)
+#     image = torch.from_numpy(image)
+#     return 2.*image - 1.
+
 def load_img(path):
     image = Image.open(path).convert("RGB")
     x, y = image.size
     print(f"Loaded input image of size ({x}, {y}) from {path}")
-    h = w = 512
-    image = transforms.CenterCrop(min(x,y))(image)
+    w = h = 512  # hardcoded 512, 这里直接 resize 到 512x512（不再 center crop）
     image = image.resize((w, h), resample=Image.Resampling.LANCZOS)
+    
+    # 转 tensor 并归一化到 [-1, 1]
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
-    return 2.*image - 1.
+    return 2. * image - 1.
+
 
 def adain(cnt_feat, sty_feat):
     cnt_mean = cnt_feat.mean(dim=[0, 2, 3],keepdim=True)
@@ -112,10 +144,11 @@ def parse_args():
     parser.add_argument('--gamma', type=float, default=0.75, help='query preservation hyperparameter')
     parser.add_argument("--attn_layer", type=str, default='6,7,8,9,10,11', help='injection attention feature layers')
     parser.add_argument('--model_config', type=str, default='models/ldm/stable-diffusion-v1/v1-inference.yaml', help='model config')
-    parser.add_argument('--precomputed', type=str, default="/temp/hanmo/style_output/StyleID/precomputed_feats", help='save path for precomputed feature')  # './precomputed_feats'
+    parser.add_argument('--precomputed', type=str, default="./precomputed_feats", help='save path for precomputed feature')  # ''
     parser.add_argument('--ckpt', type=str, default='models/ldm/stable-diffusion-v1/model.ckpt', help='model checkpoint')
     parser.add_argument('--precision', type=str, default='autocast', help='choices: ["full", "autocast"]')
     parser.add_argument('--output_dir', type=str, default='output')
+    parser.add_argument("--log_path", type=str, default="./logs/log_styleID.jsonl")
     parser.add_argument("--without_init_adain", action='store_true')
     parser.add_argument("--without_attn_injection", action='store_true')
     return parser.parse_args()
@@ -183,14 +216,6 @@ def load_or_invert_feature(
             print(f"💾 Saved new feature cache: {feat_name}")
 
     return feat, z_enc, feat_name, cache_hit
-
-
-# def data_loader(sty_img_list, style_base_dir, cnt_img_list, cnt_base_dir):
-#     for sty_name in sty_img_list:
-#         for cnt_name in cnt_img_list:
-#             sty_path = os.path.join(style_base_dir, sty_name)
-#             cnt_path = os.path.join(cnt_base_dir, cnt_name)
-#             yield sty_name, sty_path, cnt_name, cnt_path
             
             
 def main():
@@ -200,11 +225,12 @@ def main():
     opt = parse_args()
     feat_path_root = opt.precomputed
 
-    seed_everything(22)
+    seed_everything(42)
     os.makedirs(opt.output_dir, exist_ok=True)
+    log_dir, log_filename = os.path.split(opt.log_path)
+    os.makedirs(log_dir, exist_ok=True)
     if len(feat_path_root) > 0:
         os.makedirs(feat_path_root, exist_ok=True)
-    
     # ===========================
     # ⚙️ 2. 模型加载与推理初始化
     # ===========================
@@ -275,16 +301,26 @@ def main():
     cnt_img_list = sorted(os.listdir(opt.cnt))
 
     begin = time.time()
-
-    # 遍历所有风格图片
+    curr = 0
+    total = len(sty_img_list) * len(cnt_img_list)
     for sty_name in sty_img_list:
         for cnt_name in cnt_img_list:
             sty_path = os.path.join(opt.sty, sty_name)
             cnt_path = os.path.join(opt.cnt, cnt_name)
             output_name = f"{Path(cnt_name).stem}@{Path(sty_name).stem}.png"
             output_path = os.path.join(opt.output_dir, output_name)
-            
-            # 🖼️ Step 4.1~4.2: 加载或反演风格特征
+
+            log_data = {}
+            log_data["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_data["content"] = cnt_path
+            log_data["style"] = sty_path
+            log_data["output"] = output_path
+
+            # ==========================
+            # 🖼️ Step 4.1~4.2: 风格特征
+            # ==========================
+            torch.cuda.synchronize()
+            t0 = time.time()
             sty_feat, sty_z_enc, sty_feat_name, cache_hit = load_or_invert_feature(
                 img_path=sty_path,
                 feat_path_root=feat_path_root,
@@ -300,8 +336,15 @@ def main():
                 device=device,
                 save_func=ddim_sampler_callback
             )
+            torch.cuda.synchronize()
+            log_data["style_feat_cache_hit"] = cache_hit
+            log_data["style_feat_build_time"] = round(time.time() - t0, 3)  # 秒
 
-            # 🖼️ Step 4.3~4.4: 加载或反演内容特征
+            # ==========================
+            # 🖼️ Step 4.3~4.4: 内容特征
+            # ==========================
+            torch.cuda.synchronize()
+            t1 = time.time()
             cnt_feat, cnt_z_enc, cnt_feat_name, cache_hit = load_or_invert_feature(
                 img_path=cnt_path,
                 feat_path_root=feat_path_root,
@@ -316,18 +359,35 @@ def main():
                 feat_maps=feat_maps,
                 device=device,
                 save_func=ddim_sampler_callback
-            )               
-            
-            # 🎨 5. 特征融合与风格生成阶段
-            with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
-                # 5.1 特征归一化融合（AdaIN）
-                adain_z_enc = cnt_z_enc if opt.without_init_adain else adain(cnt_z_enc, sty_z_enc)
-                
-                # 5.2 注意力特征注入融合
-                feat_maps = None if opt.without_attn_injection else feat_merge(opt, cnt_feat, sty_feat, start_step=start_step)
+            )
+            torch.cuda.synchronize()
+            log_data["cnt_feat_cache_hit"] = cache_hit
+            log_data["cnt_feat_build_time"] = round(time.time() - t1, 3)
 
-                # 5.3 执行风格化采样（反向扩散生成）
-                samples_ddim, _intermediates = sampler.sample(
+            # ==========================
+            # 🎨 Step 5: 风格生成阶段
+            # ==========================
+            log_data["generate_details"] = {}
+
+            with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
+                # 5.1 AdaIN 融合
+                torch.cuda.synchronize()
+                t2 = time.time()
+                adain_z_enc = cnt_z_enc if opt.without_init_adain else adain(cnt_z_enc, sty_z_enc)
+                torch.cuda.synchronize()
+                log_data["generate_details"]["AdaIN_cost"] = round(time.time() - t2, 3)
+
+                # 5.2 注意力特征融合
+                torch.cuda.synchronize()
+                t3 = time.time()
+                feat_maps = None if opt.without_attn_injection else feat_merge(opt, cnt_feat, sty_feat, start_step=start_step)
+                torch.cuda.synchronize()
+                log_data["generate_details"]["feat_merge_cost"] = round(time.time() - t3, 3)
+
+                # 5.3 扩散采样
+                torch.cuda.synchronize()
+                t4 = time.time()
+                samples_ddim, _ = sampler.sample(
                     S=ddim_steps,
                     batch_size=1,
                     shape=shape,
@@ -338,17 +398,49 @@ def main():
                     injected_features=feat_maps,
                     start_step=start_step,
                 )
+                torch.cuda.synchronize()
+                log_data["generate_details"]["sampling_cost"] = round(time.time() - t4, 3)
 
-                # 💾 6. 解码与结果保存阶段
+                # ==========================
+                # 💾 Step 6: 解码与保存阶段
+                # ==========================
+                torch.cuda.synchronize()
+                t5 = time.time()
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                 x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
                 x_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
                 x_sample = 255. * rearrange(x_image_torch[0].cpu().numpy(), 'c h w -> h w c')
+                torch.cuda.synchronize()
+                log_data["generate_details"]["decoding_cost"] = round(time.time() - t5, 3)
+
                 img = Image.fromarray(x_sample.astype(np.uint8))
                 img.save(output_path)
-                print(f"image saved to {output_path}")
+                print(f"✅ Image saved to {output_path}")
+
+            # ==========================
+            # 🧾 Step 7: 写入日志
+            # ==========================
+            log_data["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_data["elapsed_sec"] = round(
+                time.mktime(datetime.strptime(log_data["end_time"], "%Y-%m-%d %H:%M:%S").timetuple())
+                - time.mktime(datetime.strptime(log_data["start_time"], "%Y-%m-%d %H:%M:%S").timetuple()), 3
+            )
+
+            # 写入 jsonl 日志
+            os.makedirs(os.path.dirname(opt.log_path), exist_ok=True)
+            with open(opt.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
                 
+            run_time = time.time() - begin
+            done_ratio = (curr+1)/total
+            eta = run_time / done_ratio * (1 - done_ratio)
+            BLUE = "\033[94m"
+            RESET = "\033[0m"
+
+            print(f"{BLUE}已经运行了 {format_duration(run_time)}, 进度 ({curr + 1}/{total}), ETA: {format_duration(eta)}{RESET}")
+            curr += 1
+
     # ===========================
     # ✅ 7. 全流程结束
     # ===========================
