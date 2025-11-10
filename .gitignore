@@ -1,2 +1,8 @@
 __pycache__
 images/
+*.ckpt
+output/
+data_vis/
+pairs2k
+logs/
+temp.json
